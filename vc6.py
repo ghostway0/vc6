@@ -301,8 +301,20 @@ MNEMONIC_MAP = {
     "b": {"type": Ops.BRANCH, "addr": "immediate", "rel": False},
     "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True},
     "ld_imm32": {"type": Ops.LOAD_IMM32, "waddr": "waddr_add", "imm": "immediate"},
-    "incsem": {"type": Ops.SEMAPHORE, "sem_inc": 1, "sem_dec": 0, "imm0": "sem_id", "required": ["imm0"]},
-    "decsem": {"type": Ops.SEMAPHORE, "sem_inc": 0, "sem_dec": 1, "imm0": "sem_id", "required": ["imm0"]},
+    "incsem": {
+        "type": Ops.SEMAPHORE,
+        "sem_inc": 1,
+        "sem_dec": 0,
+        "imm0": "sem_id",
+        "required": ["imm0"],
+    },
+    "decsem": {
+        "type": Ops.SEMAPHORE,
+        "sem_inc": 0,
+        "sem_dec": 1,
+        "imm0": "sem_id",
+        "required": ["imm0"],
+    },
 }
 
 DEFAULT_VALUES = {
@@ -441,7 +453,6 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
                         name = f"imm{i}"
                     operands[name] = p
 
-
                 ops.append(
                     Op(
                         mnemonic=mnemonic,
@@ -465,7 +476,7 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
         if isinstance(operand, str) and operand not in REG_MAP:
             raise AssembleError(f"Unknown operand format {operand}.", op.origin)
 
-    # check if immediates are in the small immed representations
+    # TODO: check if immediates are in the small immed representations
 
     regfile = None
     for operand in op.raw_operands:
@@ -477,6 +488,19 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
     # TODO: Somewhere in the datasheet. Trust me.
     natural_regfile = "a" if args["op_code"] == "op_add" else "b"
     args["ws"] = int(regfile != natural_regfile)
+
+    m = {"add_a": "waddr_mul", "mul_a": "waddr_mul", "add_b": "raddr_b", "mul_b": "raddr_a"}
+    if args["ws"]:
+        m["add_b"], m["mul_b"] = m["add_b"], m["mul_b"]
+
+    for a, b in m.items():
+        if a not in args:
+            continue
+
+        reg = args[a]
+
+        args[a] = INPUT_MUX[reg]
+        args[b] = REG_MAP[reg]
 
     return args
 
@@ -568,7 +592,9 @@ def process_ops(ops: list[Op]) -> list[Op]:
         if not mapping:
             raise AssembleError(f"Unknown mnemonic: {op_name}", op.origin)
 
-        args = map_by(mapping, op.args, required=mapping.get("required", []), exclude=["required"])
+        args = map_by(
+            mapping, op.args, required=mapping.get("required", []), exclude=["required"]
+        )
         if args is None:
             raise AssembleError(
                 f"Wrong arguments to operation {op.mnemonic}.", op.origin
@@ -602,6 +628,7 @@ def combine(a: dict, b: dict) -> dict:
         out[k] = v
     return out
 
+
 def fuse(ops: list[Op]) -> list[Op]:
     stack = deque(ops)
     out = []
@@ -611,7 +638,7 @@ def fuse(ops: list[Op]) -> list[Op]:
         if aa.args["type"] != Ops.ALU:
             out.append(aa)
             continue
-        
+
         bb = stack.popleft()
         if bb.args["type"] != Ops.ALU:
             out.append(bb)
@@ -699,9 +726,7 @@ def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
 
             enc = ENCODING[op.args["type"]]
             if field not in enc:
-                raise AssembleError(
-                    f"Unknown field for relocation: {field}", op.origin
-                )
+                raise AssembleError(f"Unknown field for relocation: {field}", op.origin)
 
             _, bits = enc[field]
             op.args[field] = _fit_and_mask(value, bits, signed, op, field)
@@ -750,7 +775,7 @@ ggjgjhgj:
     print(ops)
     ops = process_ops(ops)
     print(ops)
-    ops = relocate_ops(ops, 0x7e215004)
+    ops = relocate_ops(ops, 0x7E215004)
     ops = fuse(ops)
     print(ops)
     code = assemble_ops(ops)
