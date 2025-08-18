@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from collections import deque
 import struct
 import sys
 import subprocess
@@ -303,7 +304,7 @@ MNEMONIC_MAP = {
         "src_b": "add_b",
     },
     "b": {"type": Ops.BRANCH, "addr": "immediate", "rel": False},
-    "br": {"type": Ops.BRANCH, "src0": "immediate", "rel": True},
+    "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True},
     "ld_imm32": {"type": Ops.LOAD_IMM32, "waddr": "waddr_add", "imm": "immediate"},
     "inc_sem": {"type": Ops.SEMAPHORE, "sem_inc": 1, "sem_dec": 0, "sem_id": "sem_id"},
     "dec_sem": {"type": Ops.SEMAPHORE, "sem_inc": 0, "sem_dec": 1, "sem_id": "sem_id"},
@@ -349,11 +350,8 @@ DEFAULT_VALUES = {
 
 
 class AssembleError(Exception):
-    def __init__(self, message: str, line: int | None = None, col: int | None = None):
-        self.line = line
-        self.col = col
-        loc = f" (line {line}, col {col})" if line is not None else ""
-        super().__init__(f"{message}{loc}")
+    def __init__(self, message: str, origin: str):
+        super().__init__(f"{message} ({origin})")
 
 
 def try_parse_operand(s: str) -> Operand | None:
@@ -365,6 +363,8 @@ def try_parse_operand(s: str) -> Operand | None:
         return bytes(s[1:-1], "utf-8").decode("unicode_escape")
     elif s.startswith("#"):
         return int(s[1:], 16)
+    elif s.isalnum() and s not in REG_MAP:
+        return s
     else:
         return None
 
@@ -474,22 +474,20 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
                 raise AssembleError(f"Cannot mix reg files in single op.", op.origin)
             regfile = operand[0]
 
-    # TODO: Somewhere in the datasheet
+    # TODO: Somewhere in the datasheet. Trust me.
     natural_regfile = "a" if args["op_code"] == "op_add" else "b"
     args["ws"] = int(regfile != natural_regfile)
 
     return args
 
 
-def _process_branch_op(operands: list[str], args: dict, mapping: dict) -> dict:
-    args[mapping["cond"]] = CONDITIONS[mapping["suffix"]]
-    try:
-        args[mapping["addr"]] = int(operands[0], 16)
-    except ValueError:
+def _process_branch_op(op: Op, args: dict, mapping: dict) -> dict:
+    args["cond_br"] = CONDITIONS[mapping["suffix"]]
+    if "immediate" not in args:
         fixup = {
-            "field": mapping["addr"],
-            "kind": "pcrel_next" if op.args["rel"] else "abs",
-            "symbol": operands[0],
+            "field": "immediate",
+            "kind": "pcrel_next" if args["rel"] else "abs",
+            "symbol": op.raw_operands[0],
             "addend": 0,
             "signed": True,
         }
@@ -537,6 +535,8 @@ def _process_data_op(operands: list[Operand], args: dict, _: dict) -> dict:
             buffer += value.encode("latin1")
         elif isinstance(value, float):
             buffer += struct.pack("f", value)
+        else:
+            raise AssembleError(f"Cannot decode data at", op.origin)
     args["data"] = buffer
     return args
 
@@ -599,19 +599,19 @@ def combine(a: dict, b: dict) -> dict:
         out[k] = v
     return out
 
-
 def fuse(ops: list[Op]) -> list[Op]:
+    stack = deque(ops)
     out = []
-    fused = False
-    for aa, bb in zip(ops, ops[1:]):
-        if fused:
-            fused = False
-            continue
 
+    while len(stack) >= 2:
+        aa = stack.popleft()
         if aa.args["type"] != Ops.ALU:
             out.append(aa)
             continue
+        
+        bb = stack.popleft()
         if bb.args["type"] != Ops.ALU:
+            out.append(bb)
             continue
 
         any_fused = aa.args["op_code"] == "fused" or bb.args["op_code"] == "fused"
@@ -620,9 +620,9 @@ def fuse(ops: list[Op]) -> list[Op]:
 
         if any_fused or same_alu or same_regfile:
             out.append(aa)
+            out.append(bb)
             continue
 
-        fused = True
         out.append(
             Op(
                 mnemonic=f"fused_{aa.mnemonic}_{bb.mnemonic}",
@@ -631,8 +631,8 @@ def fuse(ops: list[Op]) -> list[Op]:
             )
         )
 
-    if not fused and len(ops) > 0:
-        out.append(ops[-1])
+    if len(stack) > 0:
+        out.append(stack.pop())
 
     return out
 
@@ -644,14 +644,14 @@ def _fit_and_mask(value: int, bits: int, signed: bool, op: Op, field: str) -> in
         if not (minv <= value <= maxv):
             raise AssembleError(
                 f"Relocation overflow for {field}: {value} not in [{minv}, {maxv}] (signed {bits}b)",
-                *op.origin,
+                op.origin,
             )
         return value & ((1 << bits) - 1)
     else:
         if value < 0 or value >= (1 << bits):
             raise AssembleError(
                 f"Relocation overflow for {field}: {value} not in [0, {1<<bits}-1] (unsigned {bits}b)",
-                *op.origin,
+                op.origin,
             )
         return value
 
@@ -682,7 +682,7 @@ def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
             signed = fixup.get("signed", False)
 
             if sym not in labels:
-                raise AssembleError(f"Undefined label: {sym}", *op.origin)
+                raise AssembleError(f"Undefined label: {sym}", op.origin)
 
             target = labels[sym]
             if kind == "abs":
@@ -692,12 +692,12 @@ def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
             elif kind == "pcrel_next":
                 value = (target + addend) - (pc + 4)
             else:
-                raise AssembleError(f"Unknown relocation kind: {kind}", *op.origin)
+                raise AssembleError(f"Unknown relocation kind: {kind}", op.origin)
 
             enc = ENCODING[op.args["type"]]
             if field not in enc:
                 raise AssembleError(
-                    f"Unknown field for relocation: {field}", *op.origin
+                    f"Unknown field for relocation: {field}", op.origin
                 )
 
             _, bits = enc[field]
@@ -727,6 +727,7 @@ define(AUX_ENABLES, 0x7e215004)
 _start:
     fadd a0, a5, a1
     fmul b0, b5, b1
+    b.cc _start
 ggjgjhgj:
     """
 
@@ -737,7 +738,7 @@ ggjgjhgj:
     ops = parse(src)
     ops = process_ops(ops)
     print(ops)
-    ops = relocate_ops(ops, 0x7E215004)
+    ops = relocate_ops(ops, 0x7e215004)
     ops = fuse(ops)
     print(ops)
     code = assemble_ops(ops)
