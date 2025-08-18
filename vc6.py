@@ -16,14 +16,18 @@ class Ops(Enum):
     LOAD_IMM_PER_ELEMENT_UNSIGNED = auto()
     SEMAPHORE = auto()
     DATA = auto()
+    LABEL = auto()
+
+
+Operand = str | float | int
 
 
 @dataclass
 class Op:
     mnemonic: str
-    raw_args: list[str]
-    origin: tuple[int, int]
+    origin: str
     args: dict[str, Any] = field(default_factory=dict)
+    raw_operands: list[Operand] = field(default_factory=list)
 
 
 OP_ADD = {
@@ -264,11 +268,12 @@ MNEMONIC_MAP = {
     "fadd": {
         "type": Ops.ALU,
         "op_code": "op_add",
-        "op_code_map": OP_ADD,
         "cond": "cond_add",
-        "waddr": "waddr_add",
-        "src_a": "add_a",
-        "src_b": "add_b",
+        "op_code_map": OP_ADD,
+        "src0": "waddr_add",
+        "src1": "add_a",
+        "src2": "add_b",
+        "required": ["src0", "src1", "src2"],
     },
     "fmul": {
         "type": Ops.ALU,
@@ -297,8 +302,8 @@ MNEMONIC_MAP = {
         "src_a": "mul_a",
         "src_b": "add_b",
     },
-    "b": {"type": Ops.BRANCH, "cond": "cond_br", "addr": "immediate", "rel": False},
-    "br": {"type": Ops.BRANCH, "cond": "cond_br", "addr": "immediate", "rel": True},
+    "b": {"type": Ops.BRANCH, "addr": "immediate", "rel": False},
+    "br": {"type": Ops.BRANCH, "src0": "immediate", "rel": True},
     "ld_imm32": {"type": Ops.LOAD_IMM32, "waddr": "waddr_add", "imm": "immediate"},
     "inc_sem": {"type": Ops.SEMAPHORE, "sem_inc": 1, "sem_dec": 0, "sem_id": "sem_id"},
     "dec_sem": {"type": Ops.SEMAPHORE, "sem_inc": 0, "sem_dec": 1, "sem_id": "sem_id"},
@@ -351,6 +356,19 @@ class AssembleError(Exception):
         super().__init__(f"{message}{loc}")
 
 
+def try_parse_operand(s: str) -> Operand | None:
+    if s.startswith("0x"):
+        return int(s[2:], 16)
+    elif "." in s:
+        return float(s)
+    elif s.startswith('"'):
+        return bytes(s[1:-1], "utf-8").decode("unicode_escape")
+    elif s.startswith("#"):
+        return int(s[1:], 16)
+    else:
+        return None
+
+
 def split_operands(s: str):
     parts = s.split(",")
     current = ""
@@ -365,9 +383,36 @@ def split_operands(s: str):
     return out
 
 
+def map_by(
+    mapping: dict[str, Any],
+    value: dict[str, Any],
+    allow_excess: bool = True,
+    required: list[str] = [],
+    exclude: list[str] = [],
+):
+    out = {}
+    for f, t in mapping.items():
+        if f in exclude:
+            continue
+
+        if isinstance(t, str):
+            if f in value:
+                out[t] = value[f]
+            elif not allow_excess:
+                return None
+            else:
+                out[f] = t
+        else:
+            out[f] = t
+
+    if not all(r in value.keys() for r in required):
+        return None
+
+    return out
+
+
 def parse(src: str) -> tuple[list[Op], dict[str, int]]:
-    ops_list = []
-    labels = {}
+    ops = []
 
     lines = src.strip().split("\n")
     for ln, line in enumerate(lines):
@@ -378,84 +423,73 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
 
         if ":" in line:
             name, line = line.split(":", 1)
-            labels[name] = len(ops_list)
+            ops.append(Op(mnemonic=name, args={"type": Ops.LABEL}, origin=f"{ln}:0"))
             if len(line.strip()) == 0:
                 continue
 
         parts = [p.strip() for p in line.split(";")]
         for pi, part in enumerate(parts):
-            op_parts = [p.strip() for p in part.split(" ", 1)]
-            mnemonic = op_parts[0]
-            operands = []
-            if len(op_parts) > 1:
-                operands = split_operands(op_parts[1])
+            for part in line.split("|"):
+                part = part.strip()
+                op_parts = [p.strip() for p in part.split(" ", 1)]
+                mnemonic = op_parts[0]
+                operands = []
+                if len(op_parts) > 1:
+                    raw_operands = split_operands(op_parts[1])
 
-            ops_list.append(Op(mnemonic=mnemonic, raw_args=operands, origin=(ln, pi)))
+                operands = {}
+                for i, p in enumerate(raw_operands):
+                    name = f"imm{i}" if (value := try_parse_operand(p)) else f"src{i}"
+                    operands[name] = p
 
-    return ops_list, labels
+                ops.append(
+                    Op(
+                        mnemonic=mnemonic,
+                        args=operands,
+                        origin=f"{ln}:{pi}",
+                        raw_operands=raw_operands,
+                    )
+                )
+
+    return ops
 
 
-def _process_alu_op(op: Op, mapping: dict) -> dict:
-    args = op.args
-
+def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
     try:
         args[mapping["op_code"]] = mapping["op_code_map"][mapping["name"]]
         args[mapping["cond"]] = CONDITIONS[mapping["suffix"]]
     except KeyError as e:
-        raise AssembleError(f"Unknown opcode or condition: {e}", *op.origin)
+        raise AssembleError(f"Unknown opcode or condition: {e}", op.origin)
 
-    src_a_str = "a0"
-    if "waddr" in mapping:
-        if not op.raw_args:
-            raise AssembleError("Missing destination register", *op.origin)
+    for operand in op.raw_operands:
+        if isinstance(operand, str) and operand not in REG_MAP:
+            raise AssembleError(f"Unknown operand format {operand}.", op.origin)
 
-        dst_reg = op.raw_args[0]
-        if dst_reg not in REG_MAP:
-            raise AssembleError(f"Invalid destination register: {dst_reg}", *op.origin)
-        args[mapping["waddr"]] = REG_MAP[dst_reg]
+    # check if immediates are in the small immed representations
 
-        if len(op.raw_args) < 2:
-            raise AssembleError("Missing source operand A", *op.origin)
-        src_a_str = op.raw_args[1]
+    regfile = None
+    for operand in op.raw_operands:
+        if isinstance(operand, str) and operand[0] in ("a", "b"):
+            if regfile is not None and operand[0] != regfile:
+                raise AssembleError(f"Cannot mix reg files in single op.", op.origin)
+            regfile = operand[0]
 
-    src_b_str = op.raw_args[2] if len(op.raw_args) > 2 else None
-
-    raddr_a_reg = src_a_str if src_a_str.startswith(("a", "b")) else None
-    raddr_b_reg = src_b_str if src_b_str and src_b_str.startswith(("a", "b")) else None
-
-    if "src_a" in mapping:
-        if src_a_str not in INPUT_MUX:
-            raise AssembleError(f"Unknown multiplexed register: {src_a_str}", *op.origin)
-        args[mapping["src_a"]] = INPUT_MUX[src_a_str]
-
-    if "src_b" in mapping and src_b_str:
-        if src_a_str not in INPUT_MUX:
-            raise AssembleError(f"Unknown multiplexed register: {src_b_str}", *op.origin)
-        args[mapping["src_b"]] = INPUT_MUX[src_b_str]
-
-    try:
-        if raddr_a_reg:
-            args["raddr_a"] = REG_MAP[raddr_a_reg]
-        if raddr_b_reg:
-            args["raddr_b"] = REG_MAP[raddr_b_reg]
-    except KeyError as e:
-        raise AssembleError(f"Unknown register: {e}", *op.origin)
-
-    # function that takes a mapping
+    # TODO: Somewhere in the datasheet
+    natural_regfile = "a" if args["op_code"] == "op_add" else "b"
+    args["ws"] = int(regfile != natural_regfile)
 
     return args
 
 
-def _process_branch_op(op: Op, mapping: dict) -> dict:
-    args = op.args
+def _process_branch_op(operands: list[str], args: dict, mapping: dict) -> dict:
     args[mapping["cond"]] = CONDITIONS[mapping["suffix"]]
     try:
-        args[mapping["addr"]] = int(op.raw_args[0], 16)
+        args[mapping["addr"]] = int(operands[0], 16)
     except ValueError:
         fixup = {
             "field": mapping["addr"],
             "kind": "pcrel_next" if op.args["rel"] else "abs",
-            "symbol": op.raw_args[0],
+            "symbol": operands[0],
             "addend": 0,
             "signed": True,
         }
@@ -463,16 +497,15 @@ def _process_branch_op(op: Op, mapping: dict) -> dict:
     return args
 
 
-def _process_load_imm_op(op: Op, mapping: dict) -> dict:
-    args = op.args
-    args[mapping["waddr"]] = REG_MAP[op.raw_args[0]]
+def _process_load_imm_op(operands: list[str], args: dict, mapping: dict) -> dict:
+    args[mapping["waddr"]] = REG_MAP[operands[0]]
     try:
-        args[mapping["imm"]] = int(op.raw_args[1], 16)
+        args[mapping["imm"]] = int(operands[1], 16)
     except ValueError:
         fixup = {
             "field": mapping["imm"],
             "kind": "abs",
-            "symbol": op.raw_args[1],
+            "symbol": operands[1],
             "addend": 0,
             "signed": False,
         }
@@ -480,15 +513,14 @@ def _process_load_imm_op(op: Op, mapping: dict) -> dict:
     return args
 
 
-def _process_semaphore_op(op: Op, mapping: dict) -> dict:
-    args = op.args
-    args["sem_id"] = int(op.raw_args[0])
+def _process_semaphore_op(operands: list[str], args: dict, mapping: dict) -> dict:
+    args["sem_id"] = int(operands[0])
     args["sem_inc"] = mapping["sem_inc"]
     args["sem_dec"] = mapping["sem_dec"]
     return args
 
 
-def _process_data_op(op: Op, _: dict) -> dict:
+def _process_data_op(operands: list[Operand], args: dict, _: dict) -> dict:
     TYPES = {
         "word": 2,
         "dword": 4,
@@ -498,16 +530,13 @@ def _process_data_op(op: Op, _: dict) -> dict:
     }
 
     buffer = bytearray()
-    for a in op.raw_args:
-        if a.startswith("0x"):
-            buffer += int(a[2:], 16).to_bytes(TYPES[op.mnemonic])
-        elif a.startswith('"'):
-            buffer += bytes(a[1:-1], "utf-8").decode("unicode_escape").encode("latin1")
-        elif "." in a:
-            buffer += struct.pack("f", float(a))
-        else:
-            buffer += int(a).to_bytes(TYPES[op.mnemonic])
-    args = op.args
+    for o in operands:
+        if isinstance(value, int):
+            buffer += o.to_bytes(TYPES[mapping["op_code"]])
+        elif isinstance(value, str):
+            buffer += value.encode("latin1")
+        elif isinstance(value, float):
+            buffer += struct.pack("f", value)
     args["data"] = buffer
     return args
 
@@ -522,38 +551,90 @@ _PROCESSORS = {
 
 
 def process_ops(ops: list[Op]) -> list[Op]:
-    processed_ops = []
+    out = []
 
     for op in ops:
+        if op.args.get("type") == Ops.LABEL:
+            out.append(op)
+            continue
+
         full_mnemonic = op.mnemonic
         op_name, suffix = (full_mnemonic.rsplit(".", 1) + ["always"])[:2]
 
         mapping = MNEMONIC_MAP.get(op_name)
         if not mapping:
-            raise AssembleError(f"Unknown mnemonic: {op_name}", *op.origin)
+            raise AssembleError(f"Unknown mnemonic: {op_name}", op.origin)
 
-        op.args = {"typ": mapping["type"]}
-        for k, v in mapping.items():
-            op.args.setdefault(k, v)
-        for k, v in DEFAULT_VALUES.get(op.args["typ"], {}).items():
-            op.args.setdefault(k, v)
+        args = map_by(mapping, op.args, required=mapping.get("required", []), exclude=["required"])
+        if args is None:
+            raise AssembleError(
+                f"Wrong arguments to operation {op.mnemonic}.", op.origin
+            )
+
+        for k, v in DEFAULT_VALUES.get(args["type"], {}).items():
+            args.setdefault(k, v)
 
         mapping["name"] = op_name
         mapping["suffix"] = suffix
 
-        processor = _PROCESSORS.get(op.args["typ"])
+        processor = _PROCESSORS.get(args["type"])
         if not processor:
             raise ValueError(f"No processor for instruction type: {op.args['typ']}")
-        processed_ops.append(
+        out.append(
             Op(
                 mnemonic=op.mnemonic,
-                raw_args=[],
-                args=processor(op, mapping),
+                args=processor(op, args, mapping),
                 origin=op.origin,
             )
         )
 
-    return processed_ops
+    return out
+
+
+def combine(a: dict, b: dict) -> dict:
+    out = {}
+    for k, v in a.items():
+        out[k] = v
+    for k, v in b.items():
+        out[k] = v
+    return out
+
+
+def fuse(ops: list[Op]) -> list[Op]:
+    out = []
+    fused = False
+    for aa, bb in zip(ops, ops[1:]):
+        if fused:
+            fused = False
+            continue
+
+        if aa.args["type"] != Ops.ALU:
+            out.append(aa)
+            continue
+        if bb.args["type"] != Ops.ALU:
+            continue
+
+        any_fused = aa.args["op_code"] == "fused" or bb.args["op_code"] == "fused"
+        same_alu = aa.args["op_code"] == bb.args["op_code"]
+        same_regfile = bb.args["ws"] != aa.args["ws"]
+
+        if any_fused or same_alu or same_regfile:
+            out.append(aa)
+            continue
+
+        fused = True
+        out.append(
+            Op(
+                mnemonic=f"fused_{aa.mnemonic}_{bb.mnemonic}",
+                args=combine(bb.args, aa.args),
+                origin=f"(fused) {aa.origin}/{bb.origin}",
+            )
+        )
+
+    if not fused and len(ops) > 0:
+        out.append(ops[-1])
+
+    return out
 
 
 def _fit_and_mask(value: int, bits: int, signed: bool, op: Op, field: str) -> int:
@@ -575,14 +656,19 @@ def _fit_and_mask(value: int, bits: int, signed: bool, op: Op, field: str) -> in
         return value
 
 
-def relocate_ops(ops: list[Op], labels: dict[str, int], pc_base: int = 0):
+def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
     INSTRUCTION_SIZE = 8
 
-    label_addrs = {
-        name: pc_base + idx * INSTRUCTION_SIZE for name, idx in labels.items()
-    }
+    out = []
 
+    labels = {}
     for i, op in enumerate(ops):
+        if op.args["type"] == Ops.LABEL:
+            labels[op.mnemonic] = pc_base + (i - len(labels)) * INSTRUCTION_SIZE
+        else:
+            out.append(op)
+
+    for i, op in enumerate(out):
         fixups = op.args.pop("fixups", [])
         if not fixups:
             continue
@@ -595,10 +681,10 @@ def relocate_ops(ops: list[Op], labels: dict[str, int], pc_base: int = 0):
             addend = fixup.get("addend", 0)
             signed = fixup.get("signed", False)
 
-            if sym not in label_addrs:
+            if sym not in labels:
                 raise AssembleError(f"Undefined label: {sym}", *op.origin)
 
-            target = label_addrs[sym]
+            target = labels[sym]
             if kind == "abs":
                 value = target + addend
             elif kind == "pcrel":
@@ -608,7 +694,7 @@ def relocate_ops(ops: list[Op], labels: dict[str, int], pc_base: int = 0):
             else:
                 raise AssembleError(f"Unknown relocation kind: {kind}", *op.origin)
 
-            enc = ENCODING[op.args["typ"]]
+            enc = ENCODING[op.args["type"]]
             if field not in enc:
                 raise AssembleError(
                     f"Unknown field for relocation: {field}", *op.origin
@@ -616,13 +702,14 @@ def relocate_ops(ops: list[Op], labels: dict[str, int], pc_base: int = 0):
 
             _, bits = enc[field]
             op.args[field] = _fit_and_mask(value, bits, signed, op, field)
+    return out
 
 
 def assemble_ops(ops: list[Op]) -> list[int]:
     out = []
     for op in ops:
         word = 0
-        enc = ENCODING[op.args["typ"]]
+        enc = ENCODING[op.args["type"]]
         for name, (off, sz) in sorted(enc.items(), key=lambda x: x[1][0], reverse=True):
             if name in op.args:
                 val = op.args[name]
@@ -638,10 +725,8 @@ def main():
 define(AUX_ENABLES, 0x7e215004)
 
 _start:
-    br.cc ggjgjhgj
-    ld_imm32 r0, AUX_ENABLES
     fadd a0, a5, a1
-    mov a10, a5
+    fmul b0, b5, b1
 ggjgjhgj:
     """
 
@@ -649,14 +734,17 @@ ggjgjhgj:
 
     src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
     print(src)
-    ops, labels = parse(src)
+    ops = parse(src)
     ops = process_ops(ops)
-    relocate_ops(ops, labels, 0x7E215004)
-    assembled_code = assemble_ops(ops)
+    print(ops)
+    ops = relocate_ops(ops, 0x7E215004)
+    ops = fuse(ops)
+    print(ops)
+    code = assemble_ops(ops)
     buffer = bytearray()
-    for code in assembled_code:
-        buffer += code.to_bytes(8, "little")
-        print(f"{code:b}", end="")
+    for c in code:
+        buffer += c.to_bytes(8, "little")
+        print(f"{c:b}", end="")
     print()
     open("out", "wb").write(buffer)
 
