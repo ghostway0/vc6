@@ -164,39 +164,43 @@ ENCODING = {
         "immediate": (0, 32),
     },
     Ops.LOAD_IMM_PER_ELEMENT_SIGNED: {
-        "sig": (56, 4),
-        "pack": (48, 4),
-        "cond_add": (45, 3),
-        "cond_mul": (42, 3),
-        "ws": (40, 1),
-        "waddr_add": (34, 6),
-        "waddr_mul": (28, 6),
-        "immediate": (0, 32),
+        "sig": (57, 4),
+        "pm": (56, 1),
+        "pack": (52, 4),
+        "cond_add": (49, 3),
+        "cond_mul": (46, 3),
+        "sf": (45, 1),
+        "ws": (44, 1),
+        "waddr_add": (38, 6),
+        "waddr_mul": (32, 6),
+        "immediate_ms": (16, 16),
+        "immediate_ls": (0, 16),
     },
     Ops.LOAD_IMM_PER_ELEMENT_UNSIGNED: {
-        "sig": (56, 4),
-        "pack": (48, 4),
-        "cond_add": (45, 3),
-        "cond_mul": (42, 3),
-        "ws": (40, 1),
-        "waddr_add": (34, 6),
-        "waddr_mul": (28, 6),
-        "immediate": (0, 32),
+        "sig": (57, 4),
+        "pm": (56, 1),
+        "pack": (52, 4),
+        "cond_add": (49, 3),
+        "cond_mul": (46, 3),
+        "sf": (45, 1),
+        "ws": (44, 1),
+        "waddr_add": (38, 6),
+        "waddr_mul": (32, 6),
+        "immediate_ms": (16, 16),
+        "immediate_ls": (0, 16),
     },
     Ops.SEMAPHORE: {
-        "sig": (56, 4),
-        "unpack": (53, 3),
-        "pm": (52, 1),
-        "pack": (48, 4),
-        "cond_add": (45, 3),
-        "cond_mul": (42, 3),
-        "sf": (41, 1),
-        "ws": (40, 1),
-        "waddr_add": (34, 6),
-        "waddr_mul": (28, 6),
-        "sem_id": (8, 4),
-        "sem_inc": (12, 1),
-        "sem_dec": (13, 1),
+        "sig": (57, 7),
+        "pm": (56, 1),
+        "pack": (52, 4),
+        "cond_add": (49, 3),
+        "cond_mul": (46, 3),
+        "sf": (45, 1),
+        "ws": (44, 1),
+        "waddr_add": (38, 6),
+        "waddr_mul": (32, 6),
+        "sa": (4, 1),
+        "sem_id": (0, 4),
     },
     Ops.DATA: {
         "data": (0, -1),
@@ -271,10 +275,9 @@ MNEMONIC_MAP = {
         "op_code": "op_add",
         "cond": "cond_add",
         "op_code_map": OP_ADD,
-        "src0": "waddr_add",
+        "src0": "add_a",
         "src1": "add_a",
-        "src2": "add_b",
-        "required": ["src0", "src1", "src2"],
+        "required": ["src0", "src1"],
     },
     "fmul": {
         "type": Ops.ALU,
@@ -282,32 +285,24 @@ MNEMONIC_MAP = {
         "op_code_map": OP_MUL,
         "cond": "cond_mul",
         "waddr": "waddr_mul",
-        "src_a": "mul_a",
-        "src_b": "add_b",
+        "src0": "mul_a",
+        "src1": "mul_b",
+        "required": ["src0", "src1"],
     },
-    "iadd": {
-        "type": Ops.ALU,
-        "op_code": "op_add",
-        "op_code_map": OP_ADD,
-        "cond": "cond_add",
-        "waddr": "waddr_add",
-        "src_a": "add_a",
-        "src_b": "add_b",
-    },
-    "imul24": {
-        "type": Ops.ALU,
-        "op_code": "op_mul",
-        "op_code_map": OP_MUL,
-        "cond": "cond_mul",
-        "waddr": "waddr_mul",
-        "src_a": "mul_a",
-        "src_b": "add_b",
-    },
+    # "imul24": {
+    #     "type": Ops.ALU,
+    #     "op_code": "op_mul",
+    #     "op_code_map": OP_MUL,
+    #     "cond": "cond_mul",
+    #     "waddr": "waddr_mul",
+    #     "src_a": "mul_a",
+    #     "src_b": "add_b",
+    # },
     "b": {"type": Ops.BRANCH, "addr": "immediate", "rel": False},
     "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True},
     "ld_imm32": {"type": Ops.LOAD_IMM32, "waddr": "waddr_add", "imm": "immediate"},
-    "inc_sem": {"type": Ops.SEMAPHORE, "sem_inc": 1, "sem_dec": 0, "sem_id": "sem_id"},
-    "dec_sem": {"type": Ops.SEMAPHORE, "sem_inc": 0, "sem_dec": 1, "sem_id": "sem_id"},
+    "incsem": {"type": Ops.SEMAPHORE, "sem_inc": 1, "sem_dec": 0, "imm0": "sem_id", "required": ["imm0"]},
+    "decsem": {"type": Ops.SEMAPHORE, "sem_inc": 0, "sem_dec": 1, "imm0": "sem_id", "required": ["imm0"]},
 }
 
 DEFAULT_VALUES = {
@@ -334,7 +329,7 @@ DEFAULT_VALUES = {
         "waddr_mul": 0b000000,  # nop for mul pipe
     },
     Ops.SEMAPHORE: {
-        "sig": 0b1110,
+        "sig": 0b1110100,
         "unpack": 0b000,
         "pm": 0b0,
         "pack": 0b0000,
@@ -355,6 +350,7 @@ class AssembleError(Exception):
 
 
 def try_parse_operand(s: str) -> Operand | None:
+    s = s.strip()
     if s.startswith("0x"):
         return int(s[2:], 16)
     elif "." in s:
@@ -362,7 +358,7 @@ def try_parse_operand(s: str) -> Operand | None:
     elif s.startswith('"'):
         return bytes(s[1:-1], "utf-8").decode("unicode_escape")
     elif s.startswith("#"):
-        return int(s[1:], 16)
+        return int(s[1:])
     elif s.isalnum() and s not in REG_MAP:
         return s
     else:
@@ -439,8 +435,12 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
 
                 operands = {}
                 for i, p in enumerate(raw_operands):
-                    name = f"imm{i}" if (value := try_parse_operand(p)) else f"src{i}"
+                    name = f"src{i}"
+                    if value := try_parse_operand(p):
+                        p = value
+                        name = f"imm{i}"
                     operands[name] = p
+
 
                 ops.append(
                     Op(
@@ -511,14 +511,13 @@ def _process_load_imm_op(operands: list[str], args: dict, mapping: dict) -> dict
     return args
 
 
-def _process_semaphore_op(operands: list[str], args: dict, mapping: dict) -> dict:
-    args["sem_id"] = int(operands[0])
+def _process_semaphore_op(op: Op, args: dict, mapping: dict) -> dict:
     args["sem_inc"] = mapping["sem_inc"]
     args["sem_dec"] = mapping["sem_dec"]
     return args
 
 
-def _process_data_op(operands: list[Operand], args: dict, _: dict) -> dict:
+def _process_data_op(op: Op, args: dict, mapping: dict) -> dict:
     TYPES = {
         "word": 2,
         "dword": 4,
@@ -528,16 +527,20 @@ def _process_data_op(operands: list[Operand], args: dict, _: dict) -> dict:
     }
 
     buffer = bytearray()
-    for o in operands:
-        if isinstance(value, int):
-            buffer += o.to_bytes(TYPES[mapping["op_code"]])
-        elif isinstance(value, str):
-            buffer += value.encode("latin1")
-        elif isinstance(value, float):
-            buffer += struct.pack("f", value)
+    for value in op.raw_operands:
+        if value := try_parse_operand(value):
+            if isinstance(value, int):
+                buffer += value.to_bytes(TYPES[op.mnemonic])
+            elif isinstance(value, str):
+                buffer += value.encode("latin1")
+            elif isinstance(value, float):
+                buffer += struct.pack("f", value)
+            else:
+                assert False
         else:
             raise AssembleError(f"Cannot decode data at", op.origin)
-    args["data"] = buffer
+    args["data"] = bytes(buffer)
+    args["size"] = len(buffer)
     return args
 
 
@@ -710,13 +713,19 @@ def assemble_ops(ops: list[Op]) -> list[int]:
     for op in ops:
         word = 0
         enc = ENCODING[op.args["type"]]
+        tsz = 0
         for name, (off, sz) in sorted(enc.items(), key=lambda x: x[1][0], reverse=True):
             if name in op.args:
                 val = op.args[name]
+                if sz < 0 and "size" in op.args:
+                    sz = op.args["size"] * 8
+
                 if isinstance(val, int):
                     val = val & ((1 << sz) - 1) if sz > 0 else val
                     word |= val << off
-        out.append(word)
+                tsz = max(sz + off, tsz)
+
+        out.append(word.to_bytes(tsz, "little"))
     return out
 
 
@@ -725,10 +734,12 @@ def main():
 define(AUX_ENABLES, 0x7e215004)
 
 _start:
-    fadd a0, a5, a1
-    fmul b0, b5, b1
-    b.cc _start
+    fadd a0, a2
+    fmul b0, b5
+    br.cc _start
+    incsem #7
 ggjgjhgj:
+    byte #10
     """
 
     unconsumed = sys.argv[1:]
@@ -736,6 +747,7 @@ ggjgjhgj:
     src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
     print(src)
     ops = parse(src)
+    print(ops)
     ops = process_ops(ops)
     print(ops)
     ops = relocate_ops(ops, 0x7e215004)
@@ -744,8 +756,9 @@ ggjgjhgj:
     code = assemble_ops(ops)
     buffer = bytearray()
     for c in code:
-        buffer += c.to_bytes(8, "little")
-        print(f"{c:b}", end="")
+        buffer += c
+        i = int.from_bytes(c, "little")
+        print(f"{i:b}", end="")
     print()
     open("out", "wb").write(buffer)
 
