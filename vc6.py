@@ -420,7 +420,7 @@ def map_by(
     return out
 
 
-def parse(src: str) -> tuple[list[Op], dict[str, int]]:
+def parse(src: str) -> list[Op]:
     ops = []
 
     lines = src.strip().split("\n")
@@ -442,7 +442,7 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
                 part = part.strip()
                 op_parts = [p.strip() for p in part.split(" ", 1)]
                 mnemonic = op_parts[0]
-                operands = []
+                raw_operands = []
                 if len(op_parts) > 1:
                     raw_operands = split_operands(op_parts[1])
 
@@ -467,10 +467,14 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
     return ops
 
 SMALL_IMM = {
-    **{v: v for v in range(16)},
-    **{v: v - 32 for v in range(16, 32)},
-    **{float(1 << v): 32 + v for v in range(8)},
-    **{1.0 / float(1 << (8 - v)): 40 + v for v in range(8)},
+    int: {
+        **{v: v for v in range(16)},
+        **{v: v - 32 for v in range(16, 32)},
+    },
+    float: {
+        **{float(1 << v): 32 + v for v in range(8)},
+        **{1.0 / float(1 << (8 - v)): 40 + v for v in range(8)},
+    }
 }
 
 def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
@@ -491,10 +495,9 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
                 raise AssembleError(f"{operand} multiple small immediate operands for ALU op.", op.origin)
 
             found = True
-            if operand not in SMALL_IMM:
+            if operand not in SMALL_IMM[type(operand)]:
                 raise AssembleError(f"{operand} is not representable in small imm space.", op.origin)
-            print(SMALL_IMM)
-            args["small_immed"] = SMALL_IMM[operand]
+            args["small_immed"] = SMALL_IMM[type(operand)][operand]
 
     regfile = None
     for operand in op.raw_operands:
@@ -686,20 +689,28 @@ def _fit_and_mask(value: int, bits: int, signed: bool, op: Op, field: str) -> in
     if signed:
         minv = -(1 << (bits - 1))
         maxv = (1 << (bits - 1)) - 1
-        if not (minv <= value <= maxv):
-            raise AssembleError(
-                f"Relocation overflow for {field}: {value} not in [{minv}, {maxv}] (signed {bits}b)",
-                op.origin,
-            )
-        return value & ((1 << bits) - 1)
     else:
-        if value < 0 or value >= (1 << bits):
-            raise AssembleError(
-                f"Relocation overflow for {field}: {value} not in [0, {1<<bits}-1] (unsigned {bits}b)",
-                op.origin,
-            )
-        return value
+        minv = 0
+        maxv = (1 << bits) - 1
 
+    if not (minv <= value <= maxv):
+        raise AssembleError(
+            f"Relocation overflow for {field}: {value} not in [{minv}, {maxv}] ({'u' if signed else 'i'}{bits})",
+            op.origin,
+        )
+
+    return value
+
+def calculate_op_size(op: Op) -> int:
+    enc = ENCODING[op.args["type"]]
+    tsz = 0
+    for name, (off, sz) in sorted(enc.items(), key=lambda x: x[1][0], reverse=True):
+        if name in op.args:
+            if sz < 0 and "size" in op.args:
+                sz = op.args["size"] * 8
+            tsz = max(sz + off, tsz)
+    return tsz
+    
 
 def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
     INSTRUCTION_SIZE = 8
@@ -707,10 +718,12 @@ def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
     out = []
 
     labels = {}
+    pc = pc_base
     for i, op in enumerate(ops):
         if op.args["type"] == Ops.LABEL:
-            labels[op.mnemonic] = pc_base + (i - len(labels)) * INSTRUCTION_SIZE
+            labels[op.mnemonic] = pc
         else:
+            pc += calculate_op_size(op)
             out.append(op)
 
     for i, op in enumerate(out):
@@ -748,8 +761,8 @@ def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
     return out
 
 
-def assemble_ops(ops: list[Op]) -> list[int]:
-    out = []
+def assemble_ops(ops: list[Op]) -> bytes:
+    out = bytearray()
     for op in ops:
         word = 0
         enc = ENCODING[op.args["type"]]
@@ -765,9 +778,12 @@ def assemble_ops(ops: list[Op]) -> list[int]:
                     word |= val << off
                 tsz = max(sz + off, tsz)
 
-        out.append(word.to_bytes(tsz, "little"))
-    return out
+        out += word.to_bytes(tsz, "little")
+    return bytes(out)
 
+def chunks(l, c: int):
+    for i in range(0, len(l), c):
+        yield l[i:i+c]
 
 def main():
     src = """
@@ -775,7 +791,7 @@ define(AUX_ENABLES, 0x7e215004)
 
 _start:
     fadd a0, a2
-    fmul b0, 0.5
+    fmul b0, 1.0
     br.cc _start
     incsem #7
 ggjgjhgj:
@@ -785,22 +801,12 @@ ggjgjhgj:
     unconsumed = sys.argv[1:]
 
     src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
-    print(src)
     ops = parse(src)
-    print(ops)
     ops = process_ops(ops)
-    print(ops)
     ops = relocate_ops(ops, 0x7E215004)
     ops = fuse(ops)
-    print(ops)
     code = assemble_ops(ops)
-    buffer = bytearray()
-    for c in code:
-        buffer += c
-        i = int.from_bytes(c, "little")
-        print(f"{i:b}", end="")
-    print()
-    open("out", "wb").write(buffer)
+    print(code.hex())
 
 
 if __name__ == "__main__":
