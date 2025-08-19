@@ -287,7 +287,8 @@ MNEMONIC_MAP = {
         "waddr": "waddr_mul",
         "src0": "mul_a",
         "src1": "mul_b",
-        "required": ["src0", "src1"],
+        "imm1": "small_immed",
+        "required": ["src0"],
     },
     # "imul24": {
     #     "type": Ops.ALU,
@@ -451,6 +452,7 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
                     if value := try_parse_operand(p):
                         p = value
                         name = f"imm{i}"
+                    raw_operands[i] = p
                     operands[name] = p
 
                 ops.append(
@@ -464,6 +466,12 @@ def parse(src: str) -> tuple[list[Op], dict[str, int]]:
 
     return ops
 
+SMALL_IMM = {
+    **{v: v for v in range(16)},
+    **{v: v - 32 for v in range(16, 32)},
+    **{float(1 << v): 32 + v for v in range(8)},
+    **{1.0 / float(1 << (8 - v)): 40 + v for v in range(8)},
+}
 
 def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
     try:
@@ -476,7 +484,17 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
         if isinstance(operand, str) and operand not in REG_MAP:
             raise AssembleError(f"Unknown operand format {operand}.", op.origin)
 
-    # TODO: check if immediates are in the small immed representations
+    found = False
+    for operand in op.raw_operands:
+        if isinstance(operand, int) or isinstance(operand, float):
+            if found:
+                raise AssembleError(f"{operand} multiple small immediate operands for ALU op.", op.origin)
+
+            found = True
+            if operand not in SMALL_IMM:
+                raise AssembleError(f"{operand} is not representable in small imm space.", op.origin)
+            print(SMALL_IMM)
+            args["small_immed"] = SMALL_IMM[operand]
 
     regfile = None
     for operand in op.raw_operands:
@@ -552,17 +570,14 @@ def _process_data_op(op: Op, args: dict, mapping: dict) -> dict:
 
     buffer = bytearray()
     for value in op.raw_operands:
-        if value := try_parse_operand(value):
-            if isinstance(value, int):
-                buffer += value.to_bytes(TYPES[op.mnemonic])
-            elif isinstance(value, str):
-                buffer += value.encode("latin1")
-            elif isinstance(value, float):
-                buffer += struct.pack("f", value)
-            else:
-                assert False
+        if isinstance(value, int):
+            buffer += value.to_bytes(TYPES[op.mnemonic])
+        elif isinstance(value, str):
+            buffer += value.encode("latin1")
+        elif isinstance(value, float):
+            buffer += struct.pack("f", value)
         else:
-            raise AssembleError(f"Cannot decode data at", op.origin)
+            assert False
     args["data"] = bytes(buffer)
     args["size"] = len(buffer)
     return args
@@ -760,7 +775,7 @@ define(AUX_ENABLES, 0x7e215004)
 
 _start:
     fadd a0, a2
-    fmul b0, b5
+    fmul b0, 0.5
     br.cc _start
     incsem #7
 ggjgjhgj:
