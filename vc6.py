@@ -668,7 +668,7 @@ def fuse(ops: list[Op]) -> list[Op]:
 
         if any_fused or same_alu or same_regfile:
             out.append(aa)
-            out.append(bb)
+            stack.appendleft(bb)
             continue
 
         out.append(
@@ -778,7 +778,8 @@ def assemble_ops(ops: list[Op]) -> bytes:
                     word |= val << off
                 tsz = max(sz + off, tsz)
 
-        out += word.to_bytes(tsz, "little")
+        assert tsz % 8 == 0
+        out += word.to_bytes(tsz // 8, "little")
     return bytes(out)
 
 def chunks(l, c: int):
