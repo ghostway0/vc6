@@ -1,4 +1,6 @@
 from dataclasses import dataclass, field
+from pprint import pprint
+import re
 from collections import deque
 import struct
 import sys
@@ -29,6 +31,17 @@ class Op:
     origin: str
     args: dict[str, Any] = field(default_factory=dict)
     raw_operands: list[Operand] = field(default_factory=list)
+
+
+def print_ops(ops: list[Op], max_val_len=40):
+    def truncate_val(v, limit):
+        s = repr(v)
+        return s if len(s) <= limit else s[:limit - 4] + '...' + s[-1]
+
+    for op in ops:
+        arg_str = " ".join(f"{k}={truncate_val(v, max_val_len)}" for k, v in op.args.items())
+        raw_str = ", ".join(repr(r) for r in op.raw_operands)
+        print(f"{op.origin}: {op.mnemonic} {arg_str} ({raw_str})")
 
 
 OP_ADD = {
@@ -299,9 +312,9 @@ MNEMONIC_MAP = {
     #     "src_a": "mul_a",
     #     "src_b": "add_b",
     # },
-    "b": {"type": Ops.BRANCH, "addr": "immediate", "rel": False},
-    "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True},
-    "ld_imm32": {"type": Ops.LOAD_IMM32, "waddr": "waddr_add", "imm": "immediate"},
+    "b": {"type": Ops.BRANCH, "imm0": "immediate", "rel": False, "required": ["imm0"]},
+    "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True, "required": ["imm0"]},
+    "ld_imm32": {"type": Ops.LOAD_IMM32, "src0": "waddr_add", "imm1": "immediate", "required": ["src0", "imm1"]},
     "incsem": {
         "type": Ops.SEMAPHORE,
         "sem_inc": 1,
@@ -372,7 +385,7 @@ def try_parse_operand(s: str) -> Operand | None:
         return bytes(s[1:-1], "utf-8").decode("unicode_escape")
     elif s.startswith("#"):
         return int(s[1:])
-    elif s.isalnum() and s not in REG_MAP:
+    elif bool(re.fullmatch(r"[A-Za-z0-9_.-]+", s)) and s not in REG_MAP:
         return s
     else:
         return None
@@ -383,10 +396,11 @@ def split_operands(s: str):
     current = ""
     out = []
     for p in parts:
-        if current or p.startswith('"'):
+        if current or p.strip().startswith('"'):
             current += p + ","
         if p.endswith('"'):
             out.append(current[:-1].strip())
+            current = ""
         elif not current:
             out.append(p.strip())
     return out
@@ -528,11 +542,11 @@ def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
 
 def _process_branch_op(op: Op, args: dict, mapping: dict) -> dict:
     args["cond_br"] = CONDITIONS[mapping["suffix"]]
-    if "immediate" not in args:
+    if isinstance(args["immediate"], str):
         fixup = {
             "field": "immediate",
             "kind": "pcrel_next" if args["rel"] else "abs",
-            "symbol": op.raw_operands[0],
+            "symbol": args["immediate"],
             "addend": 0,
             "signed": True,
         }
@@ -540,19 +554,18 @@ def _process_branch_op(op: Op, args: dict, mapping: dict) -> dict:
     return args
 
 
-def _process_load_imm_op(operands: list[str], args: dict, mapping: dict) -> dict:
-    args[mapping["waddr"]] = REG_MAP[operands[0]]
-    try:
-        args[mapping["imm"]] = int(operands[1], 16)
-    except ValueError:
+def _process_load_imm_op(op: Op, args: dict, mapping: dict) -> dict:
+    args["waddr_add"] = REG_MAP[args["waddr_add"]]
+    if isinstance(args["immediate"], str):
         fixup = {
-            "field": mapping["imm"],
+            "field": "immediate",
             "kind": "abs",
-            "symbol": operands[1],
+            "symbol": args["immediate"],
             "addend": 0,
             "signed": False,
         }
         args.setdefault("fixups", []).append(fixup)
+
     return args
 
 
@@ -581,7 +594,7 @@ def _process_data_op(op: Op, args: dict, mapping: dict) -> dict:
             buffer += struct.pack("f", value)
         else:
             assert False
-    args["data"] = bytes(buffer)
+    args["data"] = int.from_bytes(bytes(buffer))
     args["size"] = len(buffer)
     return args
 
@@ -595,7 +608,7 @@ _PROCESSORS = {
 }
 
 
-def process_ops(ops: list[Op]) -> list[Op]:
+def elaborate_ops(ops: list[Op]) -> list[Op]:
     out = []
 
     for op in ops:
@@ -659,6 +672,7 @@ def fuse(ops: list[Op]) -> list[Op]:
 
         bb = stack.popleft()
         if bb.args["type"] != Ops.ALU:
+            out.append(aa)
             out.append(bb)
             continue
 
@@ -773,41 +787,132 @@ def assemble_ops(ops: list[Op]) -> bytes:
                 if sz < 0 and "size" in op.args:
                     sz = op.args["size"] * 8
 
-                if isinstance(val, int):
-                    val = val & ((1 << sz) - 1) if sz > 0 else val
-                    word |= val << off
+                assert isinstance(val, int)
+                val = val & ((1 << sz) - 1) if sz > 0 else val
+                word |= val << off
                 tsz = max(sz + off, tsz)
 
         assert tsz % 8 == 0
-        out += word.to_bytes(tsz // 8, "little")
+        out += word.to_bytes(tsz // 8, "big")
     return bytes(out)
 
 def chunks(l, c: int):
     for i in range(0, len(l), c):
         yield l[i:i+c]
 
+# def main():
+#     src = """
+# define(AUX_ENABLES, 0x7e215004)
+#
+# _start:
+#     fadd a0, a2
+#     fmul b0, 1.0
+#     br.cc _start
+#     incsem #7
+# ggjgjhgj:
+#     byte #10
+#     """
+#
+#     unconsumed = sys.argv[1:]
+#
+#     src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
+#     ops = parse(src)
+#     ops = elaborate_ops(ops)
+#     ops = relocate_ops(ops, 0x7E215004)
+#     ops = fuse(ops)
+#     code = assemble_ops(ops)
+#     print(code.hex())
+
 def main():
-    src = """
-define(AUX_ENABLES, 0x7e215004)
+    tests = [
+        # Basic ALU test
+        """
+        _loop:
+            fadd a1, a2
+            fmul b1, 1.0
+            b.always _loop
+        """,
 
-_start:
-    fadd a0, a2
-    fmul b0, 1.0
-    br.cc _start
-    incsem #7
-ggjgjhgj:
-    byte #10
-    """
+        # Branch with label and relocation
+        """
+        start:
+            mov r0, r1
+            br.zs start
+        """,
 
-    unconsumed = sys.argv[1:]
+        # Load immediate with integer and label fixup
+        """
+        ld_imm32 r0, 0x12345678
+        ld_imm32 r1, label
+        label:
+        """,
 
-    src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
-    ops = parse(src)
-    ops = process_ops(ops)
-    ops = relocate_ops(ops, 0x7E215004)
-    ops = fuse(ops)
-    code = assemble_ops(ops)
-    print(code.hex())
+        # Semaphore increment and decrement
+        """
+        incsem #3
+        decsem #3
+        """,
+
+        # Data section with different types
+        """
+        byte #1, #2, #3
+        word #256
+        dword #65536
+        qword #4294967296
+        """,
+
+        # String in data
+        """
+        bytes "hello\\n", "world"
+        """,
+
+        # Fusion of ALU instructions
+        """
+        fadd a0, a1
+        fmul b0, 1.0
+        """,
+
+        # Mixed regfile conflict test
+        """
+        fadd a0, b1
+        """,
+
+        # Invalid small imm value
+        """
+        fmul b1, 3.14
+        """,
+
+        """
+        label: fadd a0, a0
+        """
+    ]
+
+    for i, src in enumerate(tests, 1):
+        print(f"--- Test {i} ---")
+        try:
+            expanded_src = subprocess.check_output(["m4"], input=src.encode()).decode()
+            ops = parse(expanded_src)
+            print("After parsing")
+            print_ops(ops)
+            ops = elaborate_ops(ops)
+            print("After elaboration")
+            print_ops(ops)
+            ops = relocate_ops(ops, 0x1000)
+            print("After relocation")
+            print_ops(ops)
+            ops = fuse(ops)
+            print("After fusion")
+            print_ops(ops)
+            code = assemble_ops(ops)
+            print(code.hex())
+        except AssembleError as e:
+            print(f"AssembleError: {e}")
+        except Exception as e:
+            print(f"Unhandled exception: {e}")
+            import traceback
+            traceback.print_exc()
+
+        print()
 
 
 if __name__ == "__main__":
