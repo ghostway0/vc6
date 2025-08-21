@@ -679,8 +679,9 @@ def fuse(ops: list[Op]) -> list[Op]:
         any_fused = aa.args["op_code"] == "fused" or bb.args["op_code"] == "fused"
         same_alu = aa.args["op_code"] == bb.args["op_code"]
         same_regfile = bb.args["ws"] != aa.args["ws"]
+        all_regs = "small_immed" not in (*aa.args.keys(), *bb.args.keys())
 
-        if any_fused or same_alu or same_regfile:
+        if any_fused or same_alu or same_regfile or not all_regs:
             out.append(aa)
             stack.appendleft(bb)
             continue
@@ -875,6 +876,11 @@ def main():
         # Mixed regfile conflict test
         """
         fadd a0, b1
+        """,
+
+        """
+        fadd a0, a1
+        fmul b1, b2
         """,
 
         # Invalid small imm value
