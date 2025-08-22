@@ -1,9 +1,7 @@
 from dataclasses import dataclass, field
-from pprint import pprint
 import re
 from collections import deque
 import struct
-import sys
 import subprocess
 from enum import Enum, auto
 from typing import Any
@@ -33,13 +31,13 @@ class Op:
     raw_operands: list[Operand] = field(default_factory=list)
 
 
-def print_ops(ops: list[Op], max_val_len=40):
-    def truncate_val(v, limit):
+def print_ops(ops: list[Op], limit=40):
+    def truncate_val(v):
         s = repr(v)
         return s if len(s) <= limit else s[:limit - 4] + '...' + s[-1]
 
     for op in ops:
-        arg_str = " ".join(f"{k}={truncate_val(v, max_val_len)}" for k, v in op.args.items())
+        arg_str = " ".join(f"{k}={truncate_val(v)}" for k, v in op.args.items())
         raw_str = ", ".join(repr(r) for r in op.raw_operands)
         print(f"{op.origin}: {op.mnemonic} {arg_str} ({raw_str})")
 
@@ -79,14 +77,14 @@ OP_MUL = {
 }
 
 CONDITIONS = {
-    "never": 0b000,
-    "always": 0b001,
-    "zs": 0b010,
-    "zc": 0b011,
-    "ns": 0b100,
-    "nc": 0b101,
-    "cs": 0b110,
-    "cc": 0b111,
+    "never": {"cond": 0b000},
+    "always": {"cond": 0b001},
+    "zs": {"cond": 0b010},
+    "zc": {"cond": 0b011},
+    "ns": {"cond": 0b100},
+    "nc": {"cond": 0b101},
+    "cs": {"cond": 0b110},
+    "cc": {"cond": 0b111},
 }
 
 INPUT_MUX = {
@@ -220,27 +218,87 @@ ENCODING = {
     },
 }
 
+PACKING_SUFFIXES = {
+    "unpack.s8": {
+        "unpack": 0b001,
+        "priority": ["unpack"],
+    },
+    "unpack.u8": {
+        "unpack": 0b100,
+        "priority": ["unpack"],
+    },
+    "pack.u8": {
+        "pack": 0b0100,
+        "priority": ["pack"],
+    },
+    "pack.f16": {
+        "pack": 0b0001,
+        "priority": ["pack"],
+    },
+    "pack.f16.sat": {
+        "pack": 0b1001,
+        "priority": ["pack"],
+    },
+}
+
 MNEMONIC_MAP = {
-    "bytes": {
-        "data": "data",
-        "type": Ops.DATA,
+    "bytes": {"data": "data", "type": Ops.DATA},
+    "byte":  {"data": "data", "type": Ops.DATA},
+    "word":  {"data": "data", "type": Ops.DATA},
+    "dword": {"data": "data", "type": Ops.DATA},
+    "qword": {"data": "data", "type": Ops.DATA},
+
+    "mov": {
+        "type": Ops.ALU,
+        "op_code": "op_add",
+        "op_code_map": OP_NOPS,
+        "cond": "cond_add",
+        "waddr": "waddr_add",
     },
-    "byte": {
-        "data": "data",
-        "type": Ops.DATA,
+    "fadd": {
+        "type": Ops.ALU,
+        "op_code": "op_add",
+        "op_code_map": OP_ADD,
+        "cond": "cond_add",
+        "src0": "waddr_add",
+        "src1": "add_a",
+        "src2": "add_b",
+        "imm2": "small_immed",
+        "suffix_map": PACKING_SUFFIXES,
+        "required": ["src0", "src1"],
     },
-    "word": {
-        "data": "data",
-        "type": Ops.DATA,
+    "iadd": {
+        "type": Ops.ALU,
+        "op_code": "op_add",
+        "op_code_map": OP_ADD,
+        "cond": "cond_add",
+        "src0": "add_a",
+        "src1": "add_a",
+        "suffix_map": PACKING_SUFFIXES,
+        "required": ["src0"],
     },
-    "dword": {
-        "data": "data",
-        "type": Ops.DATA,
+    "fmul": {
+        "type": Ops.ALU,
+        "op_code": "op_mul",
+        "op_code_map": OP_MUL,
+        "cond": "cond_mul",
+        "src0": "waddr_mul",
+        "src1": "mul_a",
+        "src2": "mul_b",
+        "imm2": "small_immed",
+        "required": ["src0", "src1"],
     },
-    "qword": {
-        "data": "data",
-        "type": Ops.DATA,
+    "imul24": {
+        "type": Ops.ALU,
+        "op_code": "op_mul",
+        "op_code_map": OP_MUL,
+        "cond": "cond_mul",
+        "src0": "mul_a",
+        "src1": "mul_b",
+        "imm1": "small_immed",
+        "required": ["src0", "imm1"],
     },
+
     "nop": {
         "sig": 1,
         "type": Ops.ALU,
@@ -254,13 +312,6 @@ MNEMONIC_MAP = {
         "op_code": "op_add",
         "op_code_map": OP_NOPS,
         "cond": "cond_add",
-    },
-    "mov": {
-        "type": Ops.ALU,
-        "op_code": "op_add",
-        "op_code_map": OP_NOPS,
-        "cond": "cond_add",
-        "waddr": "waddr_add",
     },
     "waitscore": {
         "sig": 5,
@@ -283,38 +334,27 @@ MNEMONIC_MAP = {
         "op_code_map": OP_NOPS,
         "cond": "cond_add",
     },
-    "fadd": {
-        "type": Ops.ALU,
-        "op_code": "op_add",
-        "cond": "cond_add",
-        "op_code_map": OP_ADD,
-        "src0": "add_a",
-        "src1": "add_a",
-        "required": ["src0", "src1"],
+
+    "b": {
+        "type": Ops.BRANCH,
+        "imm0": "immediate",
+        "rel": False,
+        "required": ["imm0"],
     },
-    "fmul": {
-        "type": Ops.ALU,
-        "op_code": "op_mul",
-        "op_code_map": OP_MUL,
-        "cond": "cond_mul",
-        "waddr": "waddr_mul",
-        "src0": "mul_a",
-        "src1": "mul_b",
-        "imm1": "small_immed",
-        "required": ["src0"],
+    "br": {
+        "type": Ops.BRANCH,
+        "imm0": "immediate",
+        "rel": True,
+        "required": ["imm0"],
     },
-    # "imul24": {
-    #     "type": Ops.ALU,
-    #     "op_code": "op_mul",
-    #     "op_code_map": OP_MUL,
-    #     "cond": "cond_mul",
-    #     "waddr": "waddr_mul",
-    #     "src_a": "mul_a",
-    #     "src_b": "add_b",
-    # },
-    "b": {"type": Ops.BRANCH, "imm0": "immediate", "rel": False, "required": ["imm0"]},
-    "br": {"type": Ops.BRANCH, "imm0": "immediate", "rel": True, "required": ["imm0"]},
-    "ld_imm32": {"type": Ops.LOAD_IMM32, "src0": "waddr_add", "imm1": "immediate", "required": ["src0", "imm1"]},
+
+    "ld_imm32": {
+        "type": Ops.LOAD_IMM32,
+        "src0": "waddr_add",
+        "imm1": "immediate",
+        "required": ["src0", "imm1"],
+    },
+
     "incsem": {
         "type": Ops.SEMAPHORE,
         "sem_inc": 1,
@@ -334,13 +374,11 @@ MNEMONIC_MAP = {
 DEFAULT_VALUES = {
     Ops.ALU: {
         "sig": 1,
-        "unpack": 0b000,
         "pm": 0b0,
         "pack": 0b0000,
+        "unpack": 0b000,
         "sf": 0b1,
         "ws": 0b0,
-        "raddr_a": 0,
-        "raddr_b": 0,
     },
     Ops.BRANCH: {
         "sig": 0b11110000,
@@ -352,7 +390,6 @@ DEFAULT_VALUES = {
         "cond_add": 0b000,  # Always
         "cond_mul": 0b000,  # Always
         "ws": 0b0,
-        "waddr_mul": 0b000000,  # nop for mul pipe
     },
     Ops.SEMAPHORE: {
         "sig": 0b1110100,
@@ -363,8 +400,6 @@ DEFAULT_VALUES = {
         "cond_mul": 0b001,  # Always
         "sf": 0b1,
         "ws": 0b0,
-        "waddr_add": 0b000000,  # nop for add pipe
-        "waddr_mul": 0b000000,  # nop for mul pipe
     },
     Ops.DATA: {},
 }
@@ -452,9 +487,9 @@ def parse(src: str) -> list[Op]:
 
         parts = [p.strip() for p in line.split(";")]
         for pi, part in enumerate(parts):
-            for part in line.split("|"):
-                part = part.strip()
-                op_parts = [p.strip() for p in part.split(" ", 1)]
+            for p in part.split("|"):
+                p = p.strip()
+                op_parts = [p.strip() for p in p.split(" ", 1)]
                 mnemonic = op_parts[0]
                 raw_operands = []
                 if len(op_parts) > 1:
@@ -463,7 +498,7 @@ def parse(src: str) -> list[Op]:
                 operands = {}
                 for i, p in enumerate(raw_operands):
                     name = f"src{i}"
-                    if value := try_parse_operand(p):
+                    if (value := try_parse_operand(p)) is not None:
                         p = value
                         name = f"imm{i}"
                     raw_operands[i] = p
@@ -488,60 +523,61 @@ SMALL_IMM = {
     float: {
         **{float(1 << v): 32 + v for v in range(8)},
         **{1.0 / float(1 << (8 - v)): 40 + v for v in range(8)},
+    },
+    str: {
     }
 }
 
 def _process_alu_op(op: Op, args: dict, mapping: dict) -> dict:
     try:
-        args[mapping["op_code"]] = mapping["op_code_map"][mapping["name"]]
-        args[mapping["cond"]] = CONDITIONS[mapping["suffix"]]
+        if "op_code_map" in mapping:
+            args[mapping["op_code"]] = mapping["op_code_map"][mapping["name"]]
     except KeyError as e:
         raise AssembleError(f"Unknown opcode or condition: {e}", op.origin)
 
     for operand in op.raw_operands:
-        if isinstance(operand, str) and operand not in REG_MAP:
+        if isinstance(operand, str) and operand not in REG_MAP and operand not in SMALL_IMM[str]:
             raise AssembleError(f"Unknown operand format {operand}.", op.origin)
 
-    found = False
+    found_immed = False
     for operand in op.raw_operands:
-        if isinstance(operand, int) or isinstance(operand, float):
-            if found:
-                raise AssembleError(f"{operand} multiple small immediate operands for ALU op.", op.origin)
-
-            found = True
+        if type(operand) in SMALL_IMM and operand not in REG_MAP:
+            if found_immed:
+                raise AssembleError(f"Multiple small immediate operands ({operand}).", op.origin)
+            found_immed = True
             if operand not in SMALL_IMM[type(operand)]:
                 raise AssembleError(f"{operand} is not representable in small imm space.", op.origin)
             args["small_immed"] = SMALL_IMM[type(operand)][operand]
 
-    regfile = None
-    for operand in op.raw_operands:
-        if isinstance(operand, str) and operand[0] in ("a", "b"):
-            if regfile is not None and operand[0] != regfile:
-                raise AssembleError(f"Cannot mix reg files in single op.", op.origin)
-            regfile = operand[0]
+    regfile_access = None
+    for key in ("add_a", "mul_a", "add_b", "mul_b"):
+        if key in args and isinstance(args[key], str) and args[key][0] in ("a", "b"):
+            regfile = args[key][0]
+            if regfile_access and regfile == regfile_access:
+                raise AssembleError("Cannot read multiple values from the same regfile.", op.origin)
+            regfile_access = regfile
 
-    # TODO: Somewhere in the datasheet. Trust me.
-    natural_regfile = "a" if args["op_code"] == "op_add" else "b"
-    args["ws"] = int(regfile != natural_regfile)
+    if "add_a" in args or "mul_a" in args:
+        dst = args.get("add_a", args.get("mul_a"))
+        natural_regfile = "a" if args.get("op_code") == "op_add" else "b"
+        args["ws"] = int(dst[0] != natural_regfile)
 
-    m = {"add_a": "waddr_mul", "mul_a": "waddr_mul", "add_b": "raddr_b", "mul_b": "raddr_a"}
-    if args["ws"]:
-        m["add_b"], m["mul_b"] = m["add_b"], m["mul_b"]
+    for src_field in ("add_a", "add_b", "mul_a", "mul_b"):
+        if src_field in args:
+            reg = args[src_field]
+            args[src_field] = INPUT_MUX[reg]
+            if reg.startswith("a"):
+                args["raddr_a"] = REG_MAP[reg]
+            elif reg.startswith("b"):
+                args["raddr_b"] = REG_MAP[reg]
 
-    for a, b in m.items():
-        if a not in args:
-            continue
-
-        reg = args[a]
-
-        args[a] = INPUT_MUX[reg]
-        args[b] = REG_MAP[reg]
+    for dst_field in ("waddr_add", "waddr_mul"):
+        if dst_field in args:
+            args[dst_field] = REG_MAP[args[dst_field]]
 
     return args
 
-
 def _process_branch_op(op: Op, args: dict, mapping: dict) -> dict:
-    args["cond_br"] = CONDITIONS[mapping["suffix"]]
     if isinstance(args["immediate"], str):
         fixup = {
             "field": "immediate",
@@ -608,6 +644,31 @@ _PROCESSORS = {
 }
 
 
+def split_mnemonic(s: str) -> tuple[str, str]:
+    s_full = s + ".always"
+    parts = s_full.split(".")
+
+    for n in range(1, len(parts) + 1):
+        op_candidate = ".".join(parts[:n])
+        suffix_candidate = ".".join(parts[n:]) if n < len(parts) else "always"
+        if op_candidate in MNEMONIC_MAP:
+            return op_candidate, suffix_candidate
+
+    return s, "always"
+
+
+def split_suffixes(suffixes: str, suffix_list: set[str]) -> list[str]:
+    out = []
+    curr = []
+    for part in suffixes.split("."):
+        curr.append(part)
+        candidate = ".".join(curr)
+        if candidate in suffix_list:
+            out.append(candidate)
+            curr = []
+    return out
+
+
 def elaborate_ops(ops: list[Op]) -> list[Op]:
     out = []
 
@@ -616,12 +677,14 @@ def elaborate_ops(ops: list[Op]) -> list[Op]:
             out.append(op)
             continue
 
-        full_mnemonic = op.mnemonic
-        op_name, suffix = (full_mnemonic.rsplit(".", 1) + ["always"])[:2]
+        op_name, suffixes = split_mnemonic(op.mnemonic)
 
         mapping = MNEMONIC_MAP.get(op_name)
         if not mapping:
             raise AssembleError(f"Unknown mnemonic: {op_name}", op.origin)
+
+        suffix_map = combine(mapping.get("suffix_map", {}), CONDITIONS)
+        suffixes = split_suffixes(suffixes, set(suffix_map.keys()))
 
         args = map_by(
             mapping, op.args, required=mapping.get("required", []), exclude=["required"]
@@ -634,8 +697,13 @@ def elaborate_ops(ops: list[Op]) -> list[Op]:
         for k, v in DEFAULT_VALUES.get(args["type"], {}).items():
             args.setdefault(k, v)
 
+        if "suffix_map" in args:
+            for suffix in suffixes:
+                args = combine(suffix_map[suffix], args)
+
         mapping["name"] = op_name
-        mapping["suffix"] = suffix
+        args["suffixes"] = suffixes
+        args["suffix_map"] = suffix_map
 
         processor = _PROCESSORS.get(args["type"])
         if not processor:
@@ -652,13 +720,21 @@ def elaborate_ops(ops: list[Op]) -> list[Op]:
 
 
 def combine(a: dict, b: dict) -> dict:
-    out = {}
-    for k, v in a.items():
-        out[k] = v
-    for k, v in b.items():
-        out[k] = v
-    return out
+    def merge_values(val_a, val_b):
+        if isinstance(val_a, dict) and isinstance(val_b, dict):
+            return combine(val_a, val_b)
+        elif isinstance(val_a, list) and isinstance(val_b, list):
+            return val_a + val_b
+        return val_b if val_b is not None else val_a
 
+    out = {key: merge_values(a.get(key), b.get(key)) for key in set(a) | set(b)}
+
+    for src in (a, b):
+        for key in src.get("priority", []):
+            if key in src:
+                out[key] = src[key]
+
+    return out
 
 def fuse(ops: list[Op]) -> list[Op]:
     stack = deque(ops)
@@ -666,22 +742,21 @@ def fuse(ops: list[Op]) -> list[Op]:
 
     while len(stack) >= 2:
         aa = stack.popleft()
-        if aa.args["type"] != Ops.ALU:
+        if aa.args["type"] != Ops.ALU or aa.args["op_code"] == "op_pack":
             out.append(aa)
             continue
 
         bb = stack.popleft()
-        if bb.args["type"] != Ops.ALU:
+        if bb.args["type"] != Ops.ALU or bb.args["op_code"] == "op_pack":
             out.append(aa)
             out.append(bb)
             continue
 
-        any_fused = aa.args["op_code"] == "fused" or bb.args["op_code"] == "fused"
-        same_alu = aa.args["op_code"] == bb.args["op_code"]
+        same_alu = aa.args.get("op_code") == bb.args.get("op_code")
         same_regfile = bb.args["ws"] != aa.args["ws"]
         all_regs = "small_immed" not in (*aa.args.keys(), *bb.args.keys())
 
-        if any_fused or same_alu or same_regfile or not all_regs:
+        if same_alu or same_regfile or not all_regs:
             out.append(aa)
             stack.appendleft(bb)
             continue
@@ -725,7 +800,7 @@ def calculate_op_size(op: Op) -> int:
                 sz = op.args["size"] * 8
             tsz = max(sz + off, tsz)
     return tsz
-    
+
 
 def relocate_ops(ops: list[Op], pc_base: int = 0) -> list[Op]:
     INSTRUCTION_SIZE = 8
@@ -783,113 +858,75 @@ def assemble_ops(ops: list[Op]) -> bytes:
         enc = ENCODING[op.args["type"]]
         tsz = 0
         for name, (off, sz) in sorted(enc.items(), key=lambda x: x[1][0], reverse=True):
-            if name in op.args:
-                val = op.args[name]
-                if sz < 0 and "size" in op.args:
-                    sz = op.args["size"] * 8
+            if name not in op.args:
+                continue
 
-                assert isinstance(val, int)
-                val = val & ((1 << sz) - 1) if sz > 0 else val
-                word |= val << off
-                tsz = max(sz + off, tsz)
+            val = op.args[name]
+            if sz < 0 and "size" in op.args:
+                sz = op.args["size"] * 8
+
+            assert isinstance(val, int)
+            val = val & ((1 << sz) - 1) if sz > 0 else val
+            word |= val << off
+            tsz = max(sz + off, tsz)
 
         assert tsz % 8 == 0
         out += word.to_bytes(tsz // 8, "big")
     return bytes(out)
 
-def chunks(l, c: int):
-    for i in range(0, len(l), c):
-        yield l[i:i+c]
-
-# def main():
-#     src = """
-# define(AUX_ENABLES, 0x7e215004)
-#
-# _start:
-#     fadd a0, a2
-#     fmul b0, 1.0
-#     br.cc _start
-#     incsem #7
-# ggjgjhgj:
-#     byte #10
-#     """
-#
-#     unconsumed = sys.argv[1:]
-#
-#     src = subprocess.check_output(["m4"] + unconsumed, input=src.encode()).decode()
-#     ops = parse(src)
-#     ops = elaborate_ops(ops)
-#     ops = relocate_ops(ops, 0x7E215004)
-#     ops = fuse(ops)
-#     code = assemble_ops(ops)
-#     print(code.hex())
 
 def main():
     tests = [
-        # Basic ALU test
         """
         _loop:
             fadd a1, a2
             fmul b1, 1.0
             b.always _loop
         """,
-
-        # Branch with label and relocation
         """
         start:
             mov r0, r1
             br.zs start
+            nop; nop; nop
         """,
-
-        # Load immediate with integer and label fixup
         """
         ld_imm32 r0, 0x12345678
         ld_imm32 r1, label
         label:
         """,
-
-        # Semaphore increment and decrement
         """
         incsem #3
         decsem #3
         """,
-
-        # Data section with different types
         """
         byte #1, #2, #3
         word #256
         dword #65536
         qword #4294967296
         """,
-
-        # String in data
         """
         bytes "hello\\n", "world"
         """,
-
-        # Fusion of ALU instructions
         """
         fadd a0, a1
         fmul b0, 1.0
         """,
-
-        # Mixed regfile conflict test
         """
         fadd a0, b1
         """,
-
         """
-        fadd a0, a1
-        fmul b1, b2
+        fadd a0, b1
+        fmul b1, a0
+        iadd a0, #0
         """,
-
-        # Invalid small imm value
         """
         fmul b1, 3.14
         """,
-
         """
         label: fadd a0, a0
+        """,
+        """
+        fadd.pack.u8 r0, r1, r2
         """
     ]
 
@@ -917,7 +954,6 @@ def main():
             print(f"Unhandled exception: {e}")
             import traceback
             traceback.print_exc()
-
         print()
 
 
