@@ -266,6 +266,7 @@ MNEMONIC_MAP = {
         "imm2": "small_immed",
         "suffix_map": PACKING_SUFFIXES,
         "required": ["src0", "src1"],
+        "priority": ["add_a", "add_b"],
     },
     "iadd": {
         "type": Ops.ALU,
@@ -276,6 +277,7 @@ MNEMONIC_MAP = {
         "src1": "add_a",
         "suffix_map": PACKING_SUFFIXES,
         "required": ["src0"],
+        "priority": ["add_a", "add_b"],
     },
     "fmul": {
         "type": Ops.ALU,
@@ -287,6 +289,7 @@ MNEMONIC_MAP = {
         "src2": "mul_b",
         "imm2": "small_immed",
         "required": ["src0", "src1"],
+        "priority": ["mul_a", "mul_b"],
     },
     "imul24": {
         "type": Ops.ALU,
@@ -297,6 +300,18 @@ MNEMONIC_MAP = {
         "src1": "mul_b",
         "imm1": "small_immed",
         "required": ["src0", "imm1"],
+        "priority": ["mul_a", "mul_b"],
+    },
+    "pack.u8": {
+        "type": Ops.ALU,
+        "op_code": "op_add",
+        "op_code_map": OP_NOPS,
+        "cond": "cond_add",
+        "src0": "waddr_add",
+        "src1": "add_a",
+        "pack": 0b0100,
+        "required": ["src0", "src1"],
+        "priority": ["add_a", "add_b"],
     },
 
     "nop": {
@@ -727,7 +742,7 @@ def combine(a: dict, b: dict) -> dict:
             return val_a + val_b
         return val_b if val_b is not None else val_a
 
-    out = {key: merge_values(a.get(key), b.get(key)) for key in set(a) | set(b)}
+    out = {key: merge_values(a.get(key), b.get(key)) for key in set(a.keys()) | set(b.keys())}
 
     for src in (a, b):
         for key in src.get("priority", []):
@@ -926,7 +941,8 @@ def main():
         label: fadd a0, a0
         """,
         """
-        fadd.pack.u8 r0, r1, r2
+        fadd.pack.u8 a0, b1, a5
+        pack.u8 a0, b1
         """
     ]
 
